@@ -1,4 +1,15 @@
 #pragma once
+// ─────────────────────────────────────────────────────────────────────────────
+//  AutoTrackPro v4.0 – Auto Frame Engine
+//  FFGL Plugin para Resolume Arena
+//  Replica el comportamiento de NVIDIA Broadcast Auto Frame:
+//  · Detecta cuerpo/rostro con skin detection + motion heuristics
+//  · Zoom digital suave centrado en el sujeto
+//  · Seguimiento predictivo con inercia cinematográfica
+//  · Reencuadre automático estilo operador humano
+//  by @thex_led
+// ─────────────────────────────────────────────────────────────────────────────
+
 #include "../../lib/ffglquickstart/FFGLEffect.h"
 #include "../../lib/ffglex/FFGLShader.h"
 #include "../../lib/ffglex/FFGLFBO.h"
@@ -6,31 +17,30 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <deque>
 
-// ─────────────────────────────────────────────
-//  AutoTrackPro v3.0 – Motor Biométrico Heurístico
-//  FFGL Plugin para Resolume Arena
-//  by @thex_led
-// ─────────────────────────────────────────────
+// Resolución del buffer de análisis (más alto = más precisión, más lento)
+static constexpr int  TRACK_BUF  = 128;
+// Máximo de blobs de sujeto rastreados simultáneamente
+static constexpr int  MAX_BLOBS  = 8;
+// Frames de historia para suavizado de posición (filtro de media móvil)
+static constexpr int  HIST_LEN   = 12;
 
-// Número máximo de clusters y landmarks AR simultáneos
-static constexpr int MAX_CLUSTERS  = 16;
-static constexpr int MAX_LANDMARKS = 12;
-
-// Resolución del buffer de análisis de movimiento
-static constexpr int MOTION_BUF_SIZE = 96;  // Subido de 64 → 96 para más precisión
-
-struct MotionCluster
+// ─── Blob: región de interés detectada ───────────────────────────────────────
+struct Blob
 {
-    float x      = 0.5f;
-    float y      = 0.5f;
-    float weight = 0.0f;
-    float life   = 0.0f;  // 0.0 = muerto, 1.0 = activo
-    int   id     = -1;    // ID único para tracking persistente
-    float velX   = 0.0f;  // Velocidad interna del cluster (predicción)
-    float velY   = 0.0f;
+    float cx     = 0.5f;   // Centro X normalizado [0,1]
+    float cy     = 0.5f;   // Centro Y normalizado [0,1]
+    float w      = 0.15f;  // Ancho del bounding box normalizado
+    float h      = 0.20f;  // Alto del bounding box normalizado
+    float mass   = 0.0f;   // Masa acumulada (confianza)
+    float life   = 0.0f;   // Vida: 1.0=activo, 0.0=muerto
+    int   id     = -1;
+    float vx     = 0.0f;   // Velocidad X (predicción)
+    float vy     = 0.0f;   // Velocidad Y (predicción)
 };
 
+// ─── AutoTrackPro: clase principal del plugin ─────────────────────────────────
 class AutoTrackPro : public ffglqs::Effect
 {
 public:
@@ -42,50 +52,58 @@ public:
     FFResult Render  ( ProcessOpenGLStruct* pGL )     override;
 
 private:
-    // ── Shaders ──────────────────────────────
-    ffglex::FFGLShader finalShader;   // Render final + HUD AR
-    ffglex::FFGLShader trackShader;   // Detección skin + optical flow
-    ffglex::FFGLShader copyShader;    // Copia frame anterior
+    // ── Shaders ──────────────────────────────────────────────────────────────
+    ffglex::FFGLShader detectShader;   // Detección skin+motion → mapa de calor
+    ffglex::FFGLShader frameShader;    // Render final: crop+zoom+follow
+    ffglex::FFGLShader copyShader;     // Copia frame anterior
 
-    // ── Frame Buffers ─────────────────────────
-    ffglex::FFGLFBO    prevFrameFBO;  // Frame anterior (comparación)
-    ffglex::FFGLFBO    motionFBO;     // Mapa de calor de movimiento/piel
+    // ── FBOs ─────────────────────────────────────────────────────────────────
+    ffglex::FFGLFBO    prevFBO;        // Frame anterior para optical flow
+    ffglex::FFGLFBO    heatFBO;        // Mapa de calor skin+motion
 
-    // ── Screen Quad ───────────────────────────
+    // ── Screen Quad ───────────────────────────────────────────────────────────
     ffglqs::ScreenQuad quad;
 
-    // ── Viewport guardado ─────────────────────
+    // ── Viewport ──────────────────────────────────────────────────────────────
     FFGLViewportStruct currentViewport = {};
 
-    // ── Estado del tracking ───────────────────
-    float currentX    = 0.5f;
-    float currentY    = 0.5f;
-    float targetX     = 0.5f;
-    float targetY     = 0.5f;
-    float activeFocusX = 0.5f;
-    float activeFocusY = 0.5f;
-    float velX        = 0.0f;
-    float velY        = 0.0f;
-    float currentZoom = 1.0f;
-    float targetZoom  = 1.0f;
-    int   lostFrames  = 0;
+    // ── Estado del Auto Frame ─────────────────────────────────────────────────
+    // Posición actual del encuadre (lo que ve la "cámara virtual")
+    float camX        = 0.5f;   // Centro X actual del crop
+    float camY        = 0.5f;   // Centro Y actual del crop
+    float camZoom     = 1.5f;   // Zoom actual (1.0=sin zoom, 3.0=muy cerca)
 
-    // ── Landmarks AR ──────────────────────────
-    float pointsX[MAX_LANDMARKS] = {};
-    float pointsY[MAX_LANDMARKS] = {};
-    int   pointsCount = 0;
+    // Posición objetivo (donde quiere ir la cámara)
+    float tgtX        = 0.5f;
+    float tgtY        = 0.5f;
+    float tgtZoom     = 1.5f;
 
-    // ── Sistema de clustering persistente ─────
-    std::vector<MotionCluster> persistentClusters;
-    int  clusterIdCounter = 0;
-    int  lockedClusterId  = -1;
+    // Velocidad de la cámara virtual (inercia cinematográfica)
+    float camVX       = 0.0f;
+    float camVY       = 0.0f;
+    float camVZ       = 0.0f;   // Velocidad de zoom
 
-    // ── Historia de movimiento (anti-parpadeo) ─
-    std::vector<float> motionHistory;
+    // ── Blobs detectados ──────────────────────────────────────────────────────
+    std::vector<Blob>  blobs;
+    int                blobIdCounter = 0;
+    int                lockedBlobId  = -1;  // ID del sujeto bloqueado
+    int                lostFrames    = 0;   // Frames sin detección
 
-    // ── Helpers internos ─────────────────────
-    void  UpdateClusters(const std::vector<unsigned char>& pixels);
-    void  ClassifyLandmarks(bool lockOn, float zoomVal, bool autoZoom);
-    void  StepMotionPhysics(float inertia);
-    float ClampF(float v, float lo, float hi) const { return v < lo ? lo : (v > hi ? hi : v); }
+    // ── Historia de posición (suavizado tipo Kalman simplificado) ─────────────
+    std::deque<float>  histX;
+    std::deque<float>  histY;
+    std::deque<float>  histW;   // Ancho del sujeto (para calcular zoom)
+    std::deque<float>  histH;   // Alto del sujeto
+
+    // ── Buffer de pixels del heat map ─────────────────────────────────────────
+    std::vector<unsigned char> heatPixels;
+    std::vector<float>         motionAcc;   // Acumulador temporal anti-parpadeo
+
+    // ── Métodos internos ──────────────────────────────────────────────────────
+    void  DetectBlobs   ();
+    void  SelectTarget  (bool lockOn, float zoomPad, bool autoZoom, float manualZoom);
+    void  StepCamera    (float smoothness);
+    float Lerp          (float a, float b, float t) const { return a + (b - a) * t; }
+    float Clamp         (float v, float lo, float hi) const { return v < lo ? lo : (v > hi ? hi : v); }
+    float SmoothDamp    (float cur, float tgt, float& vel, float smooth) const;
 };
